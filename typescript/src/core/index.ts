@@ -53,3 +53,6 @@ export * from './threads';
 
 // Middleware exports
 export * from '../middleware';
+
+// Lifecycle exports
+export * from './lifecycle';
