@@ -17,3 +17,12 @@ export {
   type MCPServerConfig,
   type UsageDetails,
 } from './chat-agent-types.js';
+export {
+  AgentProtocol as AgentProtocolV2,
+  AgentRunOptions,
+  AgentRunResponse as AgentRunResponseV2,
+  AgentRunResponseUpdate as AgentRunResponseV2Update,
+  isAgentProtocol,
+  assertAgentProtocol,
+  AgentProtocolGuards,
+} from './protocol.js';
