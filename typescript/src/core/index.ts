@@ -50,3 +50,6 @@ export {
 
 // Thread exports
 export * from './threads';
+
+// Middleware exports
+export * from '../middleware';
