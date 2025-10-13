@@ -31,7 +31,14 @@ export {
   type JsonSchema,
   type AIToolSchema,
 } from './schema.js';
-export { type MCPTool, isMCPTool } from './mcp-tool.js';
+export {
+  type MCPTool,
+  isMCPTool,
+  MCPStdioTool,
+  MCPSSETool,
+  MCPWebSocketTool,
+  type MCPToolOptions,
+} from './mcp-tool.js';
 export {
   autoInvokeFunction,
   executeFunctionCalls,
