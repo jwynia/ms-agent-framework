@@ -14,6 +14,7 @@ import type {
   ChatAgentOptions,
   ChatRunOptions,
   ToolChoice,
+  UsageDetails,
 } from './chat-agent-types.js';
 import { AgentRunResponse, AgentRunResponseUpdate } from './chat-agent-types.js';
 import type { ChatMessage, Content } from '../types/chat-message.js';
@@ -24,6 +25,8 @@ import type { AITool } from '../tools/base-tool.js';
 import type { ContextProvider } from '../context/context-provider.js';
 import { AgentInitializationError } from '../errors/agent-errors.js';
 import type { AgentInfo } from '../types/agent-info.js';
+import { getLogger } from '../logging/logger.js';
+import { ThreadType } from '../threads/service-thread-types.js';
 
 /**
  * ChatAgent - Main agent class for chat-based interactions.
@@ -121,6 +124,8 @@ export class ChatAgent extends BaseAgent {
   private readonly _messageStoreFactory?: () => ChatMessageStore;
   private readonly _conversationId?: string;
   private readonly _contextProviders?: ContextProvider[];
+  private readonly _logger = getLogger('agent_framework.agents.chat');
+  private readonly _threadsNotified = new WeakSet<AgentThread>();
 
   // Chat completion parameters
   private readonly _modelId?: string;
@@ -401,10 +406,10 @@ export class ChatAgent extends BaseAgent {
     const thread = options?.thread || this.getNewThread();
 
     // 3. Prepare thread and messages
-    const { preparedMessages } = await this.prepareThreadAndMessages(thread, normalizedMessages, options);
+    const { preparedMessages, contextTools } = await this.prepareThreadAndMessages(thread, normalizedMessages, options);
 
-    // 4. Merge chat options (constructor + runtime overrides)
-    const chatOptions = this.mergeChatOptions(options);
+    // 4. Merge chat options (constructor + runtime overrides + context tools)
+    const chatOptions = this.mergeChatOptions(options, contextTools);
 
     // 5. Call chat client
     const responseMessage = await this._chatClient.complete(preparedMessages, chatOptions);
@@ -418,10 +423,19 @@ export class ChatAgent extends BaseAgent {
     // 7. Update thread with conversation ID (determines thread type if undetermined)
     thread.updateWithConversationId(conversationId, this._messageStoreFactory);
 
+    // 7a. If thread was just determined as service-managed, notify context providers (only once per thread)
+    if (conversationId && thread.threadType === ThreadType.SERVICE_MANAGED && !this._threadsNotified.has(thread)) {
+      this._threadsNotified.add(thread);
+      await this.notifyContextProvidersThreadCreated(conversationId);
+    }
+
     // 8. Store new messages in thread (if local-managed)
     await thread.onNewMessages([...normalizedMessages, responseMessage]);
 
-    // 9. Create and return AgentRunResponse
+    // 9. Notify context providers of invocation completion
+    await this.notifyContextProvidersInvoked(normalizedMessages, [responseMessage]);
+
+    // 10. Create and return AgentRunResponse
     return new AgentRunResponse({
       messages: [responseMessage],
       responseId,
@@ -450,7 +464,7 @@ export class ChatAgent extends BaseAgent {
     thread: AgentThread,
     newMessages: ChatMessage[],
     options?: ChatRunOptions,
-  ): Promise<{ preparedMessages: ChatMessage[]; systemMessage?: ChatMessage }> {
+  ): Promise<{ preparedMessages: ChatMessage[]; systemMessage?: ChatMessage; contextTools: AITool[] }> {
     // Load existing messages from thread
     const existingMessages = await thread.getMessages();
 
@@ -466,17 +480,25 @@ export class ChatAgent extends BaseAgent {
       // Get tools for context (from constructor + runtime options)
       const toolsForContext = this.getToolsForExecution(options);
 
-      // Call invoking() on each provider
+      // Call invoking() on each provider with error handling
       for (const provider of this._contextProviders) {
-        const context = await provider.invoking(allMessagesForContext, toolsForContext);
-        if (context.instructions) {
-          contextInstructions.push(context.instructions);
-        }
-        if (context.messages) {
-          contextMessages.push(...context.messages);
-        }
-        if (context.tools) {
-          contextTools.push(...context.tools);
+        try {
+          const context = await provider.invoking(allMessagesForContext, toolsForContext);
+          if (context.instructions) {
+            contextInstructions.push(context.instructions);
+          }
+          if (context.messages) {
+            contextMessages.push(...context.messages);
+          }
+          if (context.tools) {
+            contextTools.push(...context.tools);
+          }
+        } catch (error) {
+          // Log error but don't fail execution
+          this._logger.warn('Context provider invoking() failed - continuing execution', {
+            provider: provider.constructor.name,
+            error: error instanceof Error ? error.message : String(error),
+          });
         }
       }
     }
@@ -513,7 +535,7 @@ export class ChatAgent extends BaseAgent {
     }
     preparedMessages.push(...newMessages);
 
-    return { preparedMessages, systemMessage };
+    return { preparedMessages, systemMessage, contextTools };
   }
 
   /**
@@ -531,14 +553,77 @@ export class ChatAgent extends BaseAgent {
   }
 
   /**
+   * Notify context providers after invocation.
+   *
+   * Calls invoked() on all context providers with error handling.
+   * Errors are logged but don't fail execution.
+   *
+   * @param inputMessages - The input messages
+   * @param responseMessages - The response messages
+   */
+  private async notifyContextProvidersInvoked(
+    inputMessages: ChatMessage[],
+    responseMessages: ChatMessage[]
+  ): Promise<void> {
+    if (!this._contextProviders || this._contextProviders.length === 0) {
+      return;
+    }
+
+    for (const provider of this._contextProviders) {
+      try {
+        await provider.invoked(responseMessages[0], {
+          instructions: this._instructions,
+          messages: inputMessages,
+          tools: this._tools,
+        });
+      } catch (error) {
+        // Log error but don't fail execution
+        this._logger.warn('Context provider invoked() failed - continuing execution', {
+          provider: provider.constructor.name,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  /**
+   * Notify context providers of thread creation.
+   *
+   * Calls threadCreated() on all context providers with error handling.
+   * Errors are logged but don't fail execution.
+   *
+   * @param threadId - The service thread ID
+   */
+  private async notifyContextProvidersThreadCreated(threadId: string): Promise<void> {
+    if (!this._contextProviders || this._contextProviders.length === 0) {
+      return;
+    }
+
+    for (const provider of this._contextProviders) {
+      try {
+        await provider.threadCreated(threadId);
+      } catch (error) {
+        // Log error but don't fail execution
+        this._logger.warn('Context provider threadCreated() failed - continuing execution', {
+          provider: provider.constructor.name,
+          threadId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  /**
    * Merge chat options from constructor and runtime overrides.
    *
    * Runtime options take precedence over constructor options.
+   * Context tools are added to existing tools.
    *
    * @param runtimeOptions - Runtime options from run() call
+   * @param contextTools - Tools from context providers
    * @returns Merged chat options for chat client
    */
-  private mergeChatOptions(runtimeOptions?: ChatRunOptions): Record<string, unknown> {
+  private mergeChatOptions(runtimeOptions?: ChatRunOptions, contextTools?: AITool[]): Record<string, unknown> {
     const options: Record<string, unknown> = {};
 
     // Add constructor options
@@ -556,7 +641,13 @@ export class ChatAgent extends BaseAgent {
     if (this._metadata !== undefined) options.metadata = this._metadata;
     if (this._toolChoice !== undefined) options.toolChoice = this._toolChoice;
     if (this._responseFormat !== undefined) options.responseFormat = this._responseFormat;
-    if (this._tools !== undefined) options.tools = this._tools;
+
+    // Merge tools: constructor tools + context tools
+    const allTools: AITool[] = [];
+    if (this._tools) allTools.push(...this._tools);
+    if (contextTools && contextTools.length > 0) allTools.push(...contextTools);
+    if (allTools.length > 0) options.tools = allTools;
+
     if (this._conversationId !== undefined) options.conversationId = this._conversationId;
 
     // Merge additional chat options
@@ -636,10 +727,10 @@ export class ChatAgent extends BaseAgent {
     const thread = options?.thread || this.getNewThread();
 
     // 3. Prepare thread and messages (reuse from run())
-    const { preparedMessages } = await this.prepareThreadAndMessages(thread, normalizedMessages, options);
+    const { preparedMessages, contextTools } = await this.prepareThreadAndMessages(thread, normalizedMessages, options);
 
     // 4. Merge chat options
-    const chatOptions = this.mergeChatOptions(options);
+    const chatOptions = this.mergeChatOptions(options, contextTools);
 
     // 5. Get streaming response from chat client
     const streamingResponse = this._chatClient.completeStream(preparedMessages, chatOptions);
@@ -730,11 +821,20 @@ export class ChatAgent extends BaseAgent {
     // 8. After streaming completes, update thread
     thread.updateWithConversationId(conversationId, this._messageStoreFactory);
 
+    // 8a. If thread was just determined as service-managed, notify context providers (only once per thread)
+    if (conversationId && thread.threadType === ThreadType.SERVICE_MANAGED && !this._threadsNotified.has(thread)) {
+      this._threadsNotified.add(thread);
+      await this.notifyContextProvidersThreadCreated(conversationId);
+    }
+
     // 9. Convert updates to complete response for message storage
     const completeResponse = AgentRunResponse.fromUpdates(allUpdates);
 
     // 10. Store messages in thread
     await thread.onNewMessages([...normalizedMessages, ...completeResponse.messages]);
+
+    // 11. Notify context providers of invocation completion
+    await this.notifyContextProvidersInvoked(normalizedMessages, completeResponse.messages);
   }
 
   /**
