@@ -34,6 +34,7 @@ import type { AgentInfo } from '../types/agent-info.js';
  * - Context providers
  * - Message normalization
  * - Streaming responses
+ * - Serialization with dependency injection
  *
  * @example
  * ```typescript
@@ -71,8 +72,49 @@ import type { AgentInfo } from '../types/agent-info.js';
  *   messageStoreFactory: () => new InMemoryMessageStore()
  * });
  * ```
+ *
+ * @example
+ * ```typescript
+ * // Serialization and deserialization
+ * const agent = new ChatAgent({
+ *   chatClient: myClient,
+ *   name: 'assistant',
+ *   temperature: 0.7
+ * });
+ * const json = agent.toJson();
+ *
+ * // Restore from JSON with injected chatClient
+ * const restored = ChatAgent.fromJson(json, {
+ *   dependencies: {
+ *     'chat_agent.chatClient': myClient
+ *   }
+ * });
+ * ```
  */
 export class ChatAgent extends BaseAgent {
+  /**
+   * Fields to exclude from serialization.
+   * Extends BaseAgent.DEFAULT_EXCLUDE with ChatAgent-specific exclusions.
+   */
+  static readonly DEFAULT_EXCLUDE = new Set<string>([
+    ...BaseAgent.DEFAULT_EXCLUDE,
+    '_chatClient', // Duplicate of chatClient (from parent)
+  ]);
+
+  /**
+   * Fields that are injectable dependencies.
+   * Extends BaseAgent.INJECTABLE with ChatAgent-specific injectable fields.
+   */
+  static readonly INJECTABLE = new Set<string>([
+    ...BaseAgent.INJECTABLE,
+    'messageStoreFactory', // Factory function is not serializable
+  ]);
+
+  /**
+   * Type identifier for serialization.
+   */
+  static readonly type = 'chat_agent';
+
   private readonly _chatClient: ChatClientProtocol;
   private readonly _instructions?: string;
   private readonly _tools?: AITool[];
@@ -693,5 +735,64 @@ export class ChatAgent extends BaseAgent {
 
     // 10. Store messages in thread
     await thread.onNewMessages([...normalizedMessages, ...completeResponse.messages]);
+  }
+
+  /**
+   * Convert the ChatAgent instance to a dictionary representation.
+   *
+   * Overrides SerializationMixin.toDict() to properly handle private fields.
+   * Maps private fields (prefixed with _) to their public names for serialization.
+   *
+   * @param options - Serialization options
+   * @returns Dictionary representation of the agent
+   *
+   * @example
+   * ```typescript
+   * const dict = agent.toDict();
+   * // {
+   * //   type: 'chat_agent',
+   * //   info: { id: '...', name: 'assistant', ... },
+   * //   instructions: 'Be helpful',
+   * //   temperature: 0.7,
+   * //   ...
+   * // }
+   * ```
+   */
+  toDict(options: import('../serialization.js').SerializationOptions = {}): Record<string, unknown> {
+    // Get base serialization from parent
+    const baseDict = super.toDict(options);
+
+    // Add ChatAgent-specific fields (mapping from private _ fields to public names)
+    // These will be automatically excluded if they're in INJECTABLE or DEFAULT_EXCLUDE
+    const chatAgentFields: Record<string, unknown> = {
+      instructions: this._instructions,
+      conversationId: this._conversationId,
+      modelId: this._modelId,
+      temperature: this._temperature,
+      maxTokens: this._maxTokens,
+      topP: this._topP,
+      frequencyPenalty: this._frequencyPenalty,
+      presencePenalty: this._presencePenalty,
+      stop: this._stop,
+      seed: this._seed,
+      store: this._store,
+      logitBias: this._logitBias,
+      user: this._user,
+      metadata: this._metadata,
+      toolChoice: this._toolChoice,
+      responseFormat: this._responseFormat,
+      additionalChatOptions: this._additionalChatOptions,
+    };
+
+    // Merge with base, excluding null/undefined if requested
+    const { excludeNone = true } = options;
+    for (const [key, value] of Object.entries(chatAgentFields)) {
+      if (excludeNone && (value === null || value === undefined)) {
+        continue;
+      }
+      baseDict[key] = value;
+    }
+
+    return baseDict;
   }
 }
