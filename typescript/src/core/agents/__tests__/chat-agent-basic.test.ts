@@ -384,45 +384,8 @@ describe('TASK-101b: ChatAgent Basic Implementation', () => {
     });
   });
 
-  describe('Placeholder methods', () => {
-    let agent: ChatAgent;
-
-    beforeEach(() => {
-      const mockClient = {} as ChatClientProtocol;
-      agent = new ChatAgent({ chatClient: mockClient });
-    });
-
-    it('should throw for run() (not yet implemented)', async () => {
-      await expect(agent.run('Hello')).rejects.toThrow('not implemented yet');
-      await expect(agent.run('Hello')).rejects.toThrow('TASK-101c');
-    });
-
-    it('should throw for runStream() (not yet implemented)', async () => {
-      const gen = agent.runStream('Hello');
-      const iterator = gen[Symbol.asyncIterator]();
-      await expect(iterator.next()).rejects.toThrow('not implemented yet');
-    });
-
-    it('should throw for run() with options', async () => {
-      await expect(agent.run('Hello', { temperature: 0.5 })).rejects.toThrow('not implemented yet');
-    });
-
-
-    it('should throw for run() with ChatMessage', async () => {
-      const msg: ChatMessage = {
-        role: MessageRole.User,
-        content: { type: 'text', text: 'Hello' },
-      };
-      await expect(agent.run(msg)).rejects.toThrow('not implemented yet');
-    });
-
-    it('should throw for run() with ChatMessage array', async () => {
-      const msgs: ChatMessage[] = [
-        { role: MessageRole.User, content: { type: 'text', text: 'Hello' } },
-      ];
-      await expect(agent.run(msgs)).rejects.toThrow('not implemented yet');
-    });
-  });
+  // Note: Placeholder tests removed - run() and runStream() are now implemented
+  // See TASK-101c and TASK-101d test files for full implementation tests
 
   describe('Property getters', () => {
     it('should expose id property', () => {

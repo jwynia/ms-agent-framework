@@ -56,3 +56,6 @@ export * from '../middleware';
 
 // Lifecycle exports
 export * from './lifecycle';
+
+// Utils exports
+export { AsyncExitStack } from './utils';
