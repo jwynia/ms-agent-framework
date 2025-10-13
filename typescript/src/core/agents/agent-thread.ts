@@ -12,6 +12,7 @@ import { ChatMessage } from '../types/chat-message';
 import { ChatMessageStore } from '../storage/message-store';
 import { InMemoryMessageStore } from '../storage/in-memory-store';
 import { AgentThreadError } from '../errors/agent-errors';
+import { ThreadType, determineThreadType } from '../threads/service-thread-types';
 
 /**
  * Serialized state for a ChatMessageStore.
@@ -83,6 +84,8 @@ export class AgentThread {
   private _serviceThreadId?: string;
   private _messageStore?: ChatMessageStore;
   private _threadId: string;
+  private _threadType: ThreadType = ThreadType.UNDETERMINED;
+  private _conversationId?: string;
 
   /**
    * Create a new AgentThread.
@@ -190,6 +193,26 @@ export class AgentThread {
    */
   get threadId(): string {
     return this._threadId;
+  }
+
+  /**
+   * Get the thread type.
+   *
+   * Thread type indicates how conversation history is managed:
+   * - SERVICE_MANAGED: Thread managed by external service
+   * - LOCAL_MANAGED: Thread managed locally with message store
+   * - UNDETERMINED: Thread type not yet determined
+   */
+  get threadType(): ThreadType {
+    return this._threadType;
+  }
+
+  /**
+   * Get the conversation ID for service-managed threads.
+   * Returns undefined if this is not a service-managed thread.
+   */
+  get conversationId(): string | undefined {
+    return this._conversationId;
   }
 
   /**
@@ -410,5 +433,71 @@ export class AgentThread {
     if (this._messageStore !== undefined) {
       await this._messageStore.clear(this._threadId);
     }
+  }
+
+  /**
+   * Update thread with conversation ID from service response.
+   *
+   * This method determines the thread type based on whether a conversation ID
+   * is returned by the service:
+   * - If conversationId provided: becomes SERVICE_MANAGED
+   * - If no conversationId and messageStoreFactory provided: becomes LOCAL_MANAGED
+   * - Once type is determined, it cannot change
+   *
+   * This method is typically called after the first agent execution when the
+   * service response indicates whether it supports thread management.
+   *
+   * @param conversationId - Conversation ID from service (if any)
+   * @param messageStoreFactory - Factory to create message store for local threads
+   * @throws {AgentThreadError} If thread type already determined and conflicts
+   *
+   * @example
+   * ```typescript
+   * // After service response with conversation ID
+   * const thread = new AgentThread();
+   * thread.updateWithConversationId('conv-123');
+   * console.log(thread.threadType); // ThreadType.SERVICE_MANAGED
+   *
+   * // After service response without conversation ID (falls back to local)
+   * const thread2 = new AgentThread();
+   * const factory = () => new InMemoryMessageStore();
+   * thread2.updateWithConversationId(undefined, factory);
+   * console.log(thread2.threadType); // ThreadType.LOCAL_MANAGED
+   *
+   * // Thread type cannot change once determined
+   * try {
+   *   thread.updateWithConversationId(undefined, factory); // Error!
+   * } catch (error) {
+   *   console.error('Cannot change thread type');
+   * }
+   * ```
+   */
+  updateWithConversationId(conversationId?: string, messageStoreFactory?: () => ChatMessageStore): void {
+    // Determine new type based on what was provided
+    const newType = determineThreadType({
+      conversationId,
+      messageStoreFactory,
+      hasConversationIdFromResponse: !!conversationId,
+    });
+
+    // If thread already determined, validate consistency
+    if (this._threadType !== ThreadType.UNDETERMINED) {
+      if (newType !== this._threadType) {
+        throw new AgentThreadError(
+          `Thread type already determined as ${this._threadType}, cannot change to ${newType}`,
+        );
+      }
+      return; // Already set, no changes needed
+    }
+
+    // Update thread based on new type
+    if (newType === ThreadType.SERVICE_MANAGED && conversationId) {
+      this._conversationId = conversationId;
+      this._threadType = ThreadType.SERVICE_MANAGED;
+    } else if (newType === ThreadType.LOCAL_MANAGED && messageStoreFactory) {
+      this._messageStore = messageStoreFactory();
+      this._threadType = ThreadType.LOCAL_MANAGED;
+    }
+    // UNDETERMINED remains UNDETERMINED (no action needed)
   }
 }
