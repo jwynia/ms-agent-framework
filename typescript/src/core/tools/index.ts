@@ -48,3 +48,23 @@ export {
   extractFunctionResults,
 } from './execution-engine.js';
 export { useFunctionInvocation, DEFAULT_MAX_ITERATIONS } from './function-invoking-client.js';
+export {
+  OpenAPIToolGenerator,
+  type OpenAPIAuthConfig,
+  type OpenAPIToolOptions,
+} from './openapi-tool-generator.js';
+export {
+  type OpenAPISpec,
+  type Operation,
+  type Parameter,
+  type Schema,
+  type Reference,
+  type PathItem,
+  type RequestBody,
+  type Response,
+  type SecurityScheme,
+  type HttpMethod,
+  HTTP_METHODS,
+  isReference,
+  isOperation,
+} from './openapi-types.js';
