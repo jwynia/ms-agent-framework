@@ -118,7 +118,8 @@ export async function autoInvokeFunction(
   }
 
   // Check if approval is required
-  const approvalMode = tool.metadata?.approvalMode as string | undefined;
+  // Support both the formal approvalMode property and legacy metadata.approvalMode
+  const approvalMode = tool.approvalMode || (tool.metadata?.approvalMode as string | undefined);
   if (approvalMode === 'always_require' && functionCall.type !== 'function_approval_response') {
     return {
       type: 'function_approval_request',
@@ -190,7 +191,9 @@ export async function executeFunctionCalls(
   for (const fc of functionCalls) {
     if (fc.type === 'function_call') {
       const tool = toolMap.get(fc.name);
-      if (tool && tool.metadata?.approvalMode === 'always_require') {
+      // Support both the formal approvalMode property and legacy metadata.approvalMode
+      const approvalMode = tool?.approvalMode || (tool?.metadata?.approvalMode as string | undefined);
+      if (tool && approvalMode === 'always_require') {
         approvalNeeded = true;
         break;
       }
