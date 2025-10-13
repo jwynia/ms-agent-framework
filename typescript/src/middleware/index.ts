@@ -60,3 +60,5 @@ export type {
   FunctionContext,
   NextFunction,
 } from './types.js';
+
+export { wrapWithMiddleware, wrapStreamWithMiddleware, applyMiddleware } from './decorators.js';
