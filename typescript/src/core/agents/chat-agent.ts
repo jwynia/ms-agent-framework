@@ -27,6 +27,8 @@ import type { ContextProvider } from '../context/context-provider.js';
 import { AgentInitializationError } from '../errors/agent-errors.js';
 import type { AgentInfo } from '../types/agent-info.js';
 import { AsyncExitStack } from '../utils/async-exit-stack.js';
+import { getLogger } from '../logging/logger.js';
+import { ThreadType } from '../threads/service-thread-types.js';
 
 /**
  * ChatAgent - Main agent class for chat-based interactions.
@@ -37,6 +39,7 @@ import { AsyncExitStack } from '../utils/async-exit-stack.js';
  * - Context providers
  * - Message normalization
  * - Streaming responses
+ * - Serialization with dependency injection
  *
  * @example
  * ```typescript
@@ -74,8 +77,50 @@ import { AsyncExitStack } from '../utils/async-exit-stack.js';
  *   messageStoreFactory: () => new InMemoryMessageStore()
  * });
  * ```
+ *
+ * @example
+ * ```typescript
+ * // Serialization and deserialization
+ * const agent = new ChatAgent({
+ *   chatClient: myClient,
+ *   name: 'assistant',
+ *   temperature: 0.7
+ * });
+ * const json = agent.toJson();
+ *
+ * // Restore from JSON with injected chatClient
+ * const restored = ChatAgent.fromJson(json, {
+ *   dependencies: {
+ *     'chat_agent.chatClient': myClient
+ *   }
+ * });
+ * ```
  */
 export class ChatAgent extends BaseAgent implements AsyncDisposable {
+  /**
+   * Fields to exclude from serialization.
+   * Extends BaseAgent.DEFAULT_EXCLUDE with ChatAgent-specific exclusions.
+   */
+  static readonly DEFAULT_EXCLUDE = new Set<string>([
+    ...BaseAgent.DEFAULT_EXCLUDE,
+    '_chatClient', // Duplicate of chatClient (from parent)
+  ]);
+
+  /**
+   * Fields that are injectable dependencies.
+   * Extends BaseAgent.INJECTABLE with ChatAgent-specific injectable fields.
+   */
+  static readonly INJECTABLE = new Set<string>([
+    ...BaseAgent.INJECTABLE,
+    'messageStoreFactory', // Factory function is not serializable
+  ]);
+
+  /**
+   * Type identifier for serialization.
+   */
+  static readonly type = 'chat_agent';
+
+
   private readonly _chatClient: ChatClientProtocol;
   private readonly _instructions?: string;
   private readonly _tools?: AITool[];
@@ -84,6 +129,8 @@ export class ChatAgent extends BaseAgent implements AsyncDisposable {
   private readonly _messageStoreFactory?: () => ChatMessageStore;
   private readonly _conversationId?: string;
   private readonly _contextProviders?: ContextProvider[];
+  private readonly _logger = getLogger('agent_framework.agents.chat');
+  private readonly _threadsNotified = new WeakSet<AgentThread>();
 
   // Chat completion parameters
   private readonly _modelId?: string;
@@ -436,13 +483,19 @@ export class ChatAgent extends BaseAgent implements AsyncDisposable {
     const thread = options?.thread || this.getNewThread();
 
     // 3. Prepare thread and messages
-    const { preparedMessages } = await this.prepareThreadAndMessages(thread, normalizedMessages, options);
+    const { preparedMessages, contextTools } = await this.prepareThreadAndMessages(thread, normalizedMessages, options);
 
     // 4. Resolve final tools (including MCP tools)
     const finalTools = await this.resolveFinalTools(this._tools, options?.tools);
 
-    // 5. Merge chat options (constructor + runtime overrides) with resolved tools
-    const chatOptions = this.mergeChatOptions(options, finalTools);
+    // 5. Merge tools: resolved tools + context tools
+    const allTools = [...finalTools];
+    if (contextTools && contextTools.length > 0) {
+      allTools.push(...contextTools);
+    }
+
+    // 6. Merge chat options (constructor + runtime overrides) with all tools
+    const chatOptions = this.mergeChatOptions(options, allTools);
 
     // 6. Call chat client
     const responseMessage = await this._chatClient.complete(preparedMessages, chatOptions);
@@ -456,10 +509,19 @@ export class ChatAgent extends BaseAgent implements AsyncDisposable {
     // 7. Update thread with conversation ID (determines thread type if undetermined)
     thread.updateWithConversationId(conversationId, this._messageStoreFactory);
 
+    // 7a. If thread was just determined as service-managed, notify context providers (only once per thread)
+    if (conversationId && thread.threadType === ThreadType.SERVICE_MANAGED && !this._threadsNotified.has(thread)) {
+      this._threadsNotified.add(thread);
+      await this.notifyContextProvidersThreadCreated(conversationId);
+    }
+
     // 8. Store new messages in thread (if local-managed)
     await thread.onNewMessages([...normalizedMessages, responseMessage]);
 
-    // 9. Create and return AgentRunResponse
+    // 9. Notify context providers of invocation completion
+    await this.notifyContextProvidersInvoked(normalizedMessages, [responseMessage]);
+
+    // 10. Create and return AgentRunResponse
     return new AgentRunResponse({
       messages: [responseMessage],
       responseId,
@@ -488,7 +550,7 @@ export class ChatAgent extends BaseAgent implements AsyncDisposable {
     thread: AgentThread,
     newMessages: ChatMessage[],
     options?: ChatRunOptions,
-  ): Promise<{ preparedMessages: ChatMessage[]; systemMessage?: ChatMessage }> {
+  ): Promise<{ preparedMessages: ChatMessage[]; systemMessage?: ChatMessage; contextTools: AITool[] }> {
     // Load existing messages from thread
     const existingMessages = await thread.getMessages();
 
@@ -504,17 +566,25 @@ export class ChatAgent extends BaseAgent implements AsyncDisposable {
       // Get tools for context (from constructor + runtime options)
       const toolsForContext = this.getToolsForExecution(options);
 
-      // Call invoking() on each provider
+      // Call invoking() on each provider with error handling
       for (const provider of this._contextProviders) {
-        const context = await provider.invoking(allMessagesForContext, toolsForContext);
-        if (context.instructions) {
-          contextInstructions.push(context.instructions);
-        }
-        if (context.messages) {
-          contextMessages.push(...context.messages);
-        }
-        if (context.tools) {
-          contextTools.push(...context.tools);
+        try {
+          const context = await provider.invoking(allMessagesForContext, toolsForContext);
+          if (context.instructions) {
+            contextInstructions.push(context.instructions);
+          }
+          if (context.messages) {
+            contextMessages.push(...context.messages);
+          }
+          if (context.tools) {
+            contextTools.push(...context.tools);
+          }
+        } catch (error) {
+          // Log error but don't fail execution
+          this._logger.warn('Context provider invoking() failed - continuing execution', {
+            provider: provider.constructor.name,
+            error: error instanceof Error ? error.message : String(error),
+          });
         }
       }
     }
@@ -551,7 +621,7 @@ export class ChatAgent extends BaseAgent implements AsyncDisposable {
     }
     preparedMessages.push(...newMessages);
 
-    return { preparedMessages, systemMessage };
+    return { preparedMessages, systemMessage, contextTools };
   }
 
   /**
@@ -569,15 +639,77 @@ export class ChatAgent extends BaseAgent implements AsyncDisposable {
   }
 
   /**
+   * Notify context providers after invocation.
+   *
+   * Calls invoked() on all context providers with error handling.
+   * Errors are logged but don't fail execution.
+   *
+   * @param inputMessages - The input messages
+   * @param responseMessages - The response messages
+   */
+  private async notifyContextProvidersInvoked(
+    inputMessages: ChatMessage[],
+    responseMessages: ChatMessage[]
+  ): Promise<void> {
+    if (!this._contextProviders || this._contextProviders.length === 0) {
+      return;
+    }
+
+    for (const provider of this._contextProviders) {
+      try {
+        await provider.invoked(responseMessages[0], {
+          instructions: this._instructions,
+          messages: inputMessages,
+          tools: this._tools,
+        });
+      } catch (error) {
+        // Log error but don't fail execution
+        this._logger.warn('Context provider invoked() failed - continuing execution', {
+          provider: provider.constructor.name,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  /**
+   * Notify context providers of thread creation.
+   *
+   * Calls threadCreated() on all context providers with error handling.
+   * Errors are logged but don't fail execution.
+   *
+   * @param threadId - The service thread ID
+   */
+  private async notifyContextProvidersThreadCreated(threadId: string): Promise<void> {
+    if (!this._contextProviders || this._contextProviders.length === 0) {
+      return;
+    }
+
+    for (const provider of this._contextProviders) {
+      try {
+        await provider.threadCreated(threadId);
+      } catch (error) {
+        // Log error but don't fail execution
+        this._logger.warn('Context provider threadCreated() failed - continuing execution', {
+          provider: provider.constructor.name,
+          threadId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  /**
    * Merge chat options from constructor and runtime overrides.
    *
    * Runtime options take precedence over constructor options.
+   * All tools (resolved MCP + context) are provided as a single array.
    *
    * @param runtimeOptions - Runtime options from run() call
-   * @param resolvedTools - Resolved tools (including MCP functions)
+   * @param allTools - All resolved tools (constructor + MCP functions + context tools)
    * @returns Merged chat options for chat client
    */
-  private mergeChatOptions(runtimeOptions?: ChatRunOptions, resolvedTools?: AITool[]): Record<string, unknown> {
+  private mergeChatOptions(runtimeOptions?: ChatRunOptions, allTools?: AITool[]): Record<string, unknown> {
     const options: Record<string, unknown> = {};
 
     // Add constructor options
@@ -595,9 +727,13 @@ export class ChatAgent extends BaseAgent implements AsyncDisposable {
     if (this._metadata !== undefined) options.metadata = this._metadata;
     if (this._toolChoice !== undefined) options.toolChoice = this._toolChoice;
     if (this._responseFormat !== undefined) options.responseFormat = this._responseFormat;
-    // Use resolved tools if provided, otherwise fall back to constructor tools
-    if (resolvedTools !== undefined) options.tools = resolvedTools;
-    else if (this._tools !== undefined) options.tools = this._tools;
+
+    // Use all tools if provided (includes constructor + MCP + context)
+    if (allTools !== undefined && allTools.length > 0) {
+      options.tools = allTools;
+    }
+
+
     if (this._conversationId !== undefined) options.conversationId = this._conversationId;
 
     // Merge additional chat options
@@ -675,13 +811,19 @@ export class ChatAgent extends BaseAgent implements AsyncDisposable {
     const thread = options?.thread || this.getNewThread();
 
     // 3. Prepare thread and messages (reuse from run())
-    const { preparedMessages } = await this.prepareThreadAndMessages(thread, normalizedMessages, options);
+    const { preparedMessages, contextTools } = await this.prepareThreadAndMessages(thread, normalizedMessages, options);
 
     // 4. Resolve final tools (including MCP tools)
     const finalTools = await this.resolveFinalTools(this._tools, options?.tools);
 
-    // 5. Merge chat options with resolved tools
-    const chatOptions = this.mergeChatOptions(options, finalTools);
+    // 5. Merge tools: resolved tools + context tools
+    const allTools = [...finalTools];
+    if (contextTools && contextTools.length > 0) {
+      allTools.push(...contextTools);
+    }
+
+    // 6. Merge chat options with all tools
+    const chatOptions = this.mergeChatOptions(options, allTools);
 
     // 6. Get streaming response from chat client
     const streamingResponse = this._chatClient.completeStream(preparedMessages, chatOptions);
@@ -772,11 +914,79 @@ export class ChatAgent extends BaseAgent implements AsyncDisposable {
     // 8. After streaming completes, update thread
     thread.updateWithConversationId(conversationId, this._messageStoreFactory);
 
+    // 8a. If thread was just determined as service-managed, notify context providers (only once per thread)
+    if (conversationId && thread.threadType === ThreadType.SERVICE_MANAGED && !this._threadsNotified.has(thread)) {
+      this._threadsNotified.add(thread);
+      await this.notifyContextProvidersThreadCreated(conversationId);
+    }
+
     // 9. Convert updates to complete response for message storage
     const completeResponse = AgentRunResponse.fromUpdates(allUpdates);
 
     // 10. Store messages in thread
     await thread.onNewMessages([...normalizedMessages, ...completeResponse.messages]);
+
+    // 11. Notify context providers of invocation completion
+    await this.notifyContextProvidersInvoked(normalizedMessages, completeResponse.messages);
+  }
+
+  /**
+   * Convert the ChatAgent instance to a dictionary representation.
+   *
+   * Overrides SerializationMixin.toDict() to properly handle private fields.
+   * Maps private fields (prefixed with _) to their public names for serialization.
+   *
+   * @param options - Serialization options
+   * @returns Dictionary representation of the agent
+   *
+   * @example
+   * ```typescript
+   * const dict = agent.toDict();
+   * // {
+   * //   type: 'chat_agent',
+   * //   info: { id: '...', name: 'assistant', ... },
+   * //   instructions: 'Be helpful',
+   * //   temperature: 0.7,
+   * //   ...
+   * // }
+   * ```
+   */
+  toDict(options: import('../serialization.js').SerializationOptions = {}): Record<string, unknown> {
+    // Get base serialization from parent
+    const baseDict = super.toDict(options);
+
+    // Add ChatAgent-specific fields (mapping from private _ fields to public names)
+    // These will be automatically excluded if they're in INJECTABLE or DEFAULT_EXCLUDE
+    const chatAgentFields: Record<string, unknown> = {
+      instructions: this._instructions,
+      conversationId: this._conversationId,
+      modelId: this._modelId,
+      temperature: this._temperature,
+      maxTokens: this._maxTokens,
+      topP: this._topP,
+      frequencyPenalty: this._frequencyPenalty,
+      presencePenalty: this._presencePenalty,
+      stop: this._stop,
+      seed: this._seed,
+      store: this._store,
+      logitBias: this._logitBias,
+      user: this._user,
+      metadata: this._metadata,
+      toolChoice: this._toolChoice,
+      responseFormat: this._responseFormat,
+      additionalChatOptions: this._additionalChatOptions,
+    };
+
+    // Merge with base, excluding null/undefined if requested
+    const { excludeNone = true } = options;
+    for (const [key, value] of Object.entries(chatAgentFields)) {
+      if (excludeNone && (value === null || value === undefined)) {
+        continue;
+      }
+      baseDict[key] = value;
+    }
+
+    return baseDict;
   }
 
   /**

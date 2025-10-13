@@ -16,6 +16,7 @@ import type { AITool } from '../tools/base-tool.js';
 import type { ContextProvider, AIContext } from '../context/context-provider.js';
 import { isMessageDelta } from '../chat-client/types.js';
 import { MessageRole } from '../types/chat-message.js';
+import { SerializationMixin } from '../serialization.js';
 
 /**
  * Protocol interface for AI agents.
@@ -103,6 +104,7 @@ export interface AgentProtocol {
  * - Context provider integration with lifecycle hooks
  * - Lifecycle hooks (beforeInvoke, afterInvoke)
  * - Streaming support
+ * - Serialization support for agent persistence
  *
  * Subclasses can override lifecycle hooks to customize behavior before and after LLM calls.
  *
@@ -155,8 +157,31 @@ export interface AgentProtocol {
  *   process.stdout.write(getTextContent(message));
  * }
  * ```
+ *
+ * @example
+ * ```typescript
+ * // Serialization support
+ * const json = agent.toJson();
+ * const restored = SimpleAgent.fromJson(json, {
+ *   dependencies: {
+ *     'simple_agent.chatClient': myChatClient
+ *   }
+ * });
+ * ```
  */
-export abstract class BaseAgent implements AgentProtocol {
+export abstract class BaseAgent extends SerializationMixin implements AgentProtocol {
+  /**
+   * Fields to exclude from serialization.
+   * Subclasses should extend this set to exclude additional fields.
+   */
+  static readonly DEFAULT_EXCLUDE = new Set<string>([]);
+
+  /**
+   * Fields that are injectable dependencies.
+   * These fields will be excluded from serialization and can be injected during deserialization.
+   * Subclasses should extend this set to include additional injectable fields.
+   */
+  static readonly INJECTABLE = new Set<string>(['chatClient', 'contextProvider']);
   /** Agent metadata and configuration */
   public readonly info: AgentInfo;
 
@@ -199,6 +224,7 @@ export abstract class BaseAgent implements AgentProtocol {
     tools?: AITool[];
     contextProvider?: ContextProvider;
   }) {
+    super(); // Call SerializationMixin constructor
     this.info = config.info;
     this.chatClient = config.chatClient;
     this.tools = config.tools || [];
