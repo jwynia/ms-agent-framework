@@ -312,25 +312,243 @@ export class ChatAgent extends BaseAgent {
     return Array.isArray(messages) ? messages : [messages];
   }
 
-  // Placeholder methods (will be implemented in TASK-101c and 101d)
-
   /**
-   * Execute agent with given messages.
-   * **NOTE**: This method is not yet implemented. See TASK-101c.
+   * Execute agent with given messages and return response.
    *
-   * @param messages - Input messages (string, ChatMessage, or array of ChatMessage)
+   * This method:
+   * 1. Normalizes input messages to ChatMessage[]
+   * 2. Creates or uses provided thread
+   * 3. Loads existing messages from thread
+   * 4. Prepares context from context providers
+   * 5. Merges agent instructions and context
+   * 6. Calls chat client with complete message list
+   * 7. Updates thread with conversation ID (determines thread type)
+   * 8. Stores new messages in thread
+   * 9. Returns AgentRunResponse
+   *
+   * @param messages - Input messages (string, ChatMessage, or ChatMessage[])
    * @param options - Optional run configuration
-   * @returns Promise resolving to agent response
-   * @throws {Error} Not yet implemented
+   * @returns Promise resolving to AgentRunResponse
+   *
+   * @example
+   * ```typescript
+   * // Simple text input
+   * const response = await agent.run('What is the weather?');
+   * console.log(response.text);
+   *
+   * // With options
+   * const response2 = await agent.run('Calculate 2+2', {
+   *   temperature: 0.7,
+   *   toolChoice: 'required'
+   * });
+   *
+   * // With existing thread
+   * const thread = agent.getNewThread();
+   * const response3 = await agent.run('Hello', { thread });
+   * const response4 = await agent.run('How are you?', { thread });
+   * ```
    */
   async run(
     messages: string | ChatMessage | ChatMessage[],
     options?: ChatRunOptions,
   ): Promise<AgentRunResponse> {
-    // Suppress unused variable warnings - these will be used in TASK-101c
-    void messages;
-    void options;
-    throw new Error('run() method not implemented yet - see TASK-101c');
+    // 1. Normalize messages
+    const normalizedMessages = this.normalizeMessages(messages);
+
+    // 2. Get or create thread
+    const thread = options?.thread || this.getNewThread();
+
+    // 3. Prepare thread and messages
+    const { preparedMessages } = await this.prepareThreadAndMessages(thread, normalizedMessages, options);
+
+    // 4. Merge chat options (constructor + runtime overrides)
+    const chatOptions = this.mergeChatOptions(options);
+
+    // 5. Call chat client
+    const responseMessage = await this._chatClient.complete(preparedMessages, chatOptions);
+
+    // 6. Extract metadata from response
+    const metadata = responseMessage.metadata || {};
+    const conversationId = metadata.conversationId as string | undefined;
+    const responseId = metadata.responseId as string | undefined;
+    const usageDetails = metadata.usage as UsageDetails | undefined;
+
+    // 7. Update thread with conversation ID (determines thread type if undetermined)
+    thread.updateWithConversationId(conversationId, this._messageStoreFactory);
+
+    // 8. Store new messages in thread (if local-managed)
+    await thread.onNewMessages([...normalizedMessages, responseMessage]);
+
+    // 9. Create and return AgentRunResponse
+    return new AgentRunResponse({
+      messages: [responseMessage],
+      responseId,
+      createdAt: responseMessage.timestamp,
+      usageDetails,
+      rawRepresentation: metadata.rawRepresentation,
+      additionalProperties: metadata,
+    });
+  }
+
+  /**
+   * Prepare thread and messages for execution.
+   *
+   * This method:
+   * - Loads existing messages from thread
+   * - Invokes context providers
+   * - Builds system message from instructions + context
+   * - Combines system message + history + new messages
+   *
+   * @param thread - The thread to use
+   * @param newMessages - New messages to add
+   * @param options - Run options
+   * @returns Prepared messages and system message
+   */
+  private async prepareThreadAndMessages(
+    thread: AgentThread,
+    newMessages: ChatMessage[],
+    options?: ChatRunOptions,
+  ): Promise<{ preparedMessages: ChatMessage[]; systemMessage?: ChatMessage }> {
+    // Load existing messages from thread
+    const existingMessages = await thread.getMessages();
+
+    // Get context from context providers
+    const contextInstructions: string[] = [];
+    const contextMessages: ChatMessage[] = [];
+    const contextTools: AITool[] = [];
+
+    if (this._contextProviders && this._contextProviders.length > 0) {
+      // Combine new messages with existing for context
+      const allMessagesForContext = [...existingMessages, ...newMessages];
+
+      // Get tools for context (from constructor + runtime options)
+      const toolsForContext = this.getToolsForExecution(options);
+
+      // Call invoking() on each provider
+      for (const provider of this._contextProviders) {
+        const context = await provider.invoking(allMessagesForContext, toolsForContext);
+        if (context.instructions) {
+          contextInstructions.push(context.instructions);
+        }
+        if (context.messages) {
+          contextMessages.push(...context.messages);
+        }
+        if (context.tools) {
+          contextTools.push(...context.tools);
+        }
+      }
+    }
+
+    // Build system message
+    let systemMessage: ChatMessage | undefined;
+    const hasInstructions = this._instructions && this._instructions.trim().length > 0;
+    const hasContextInstructions = contextInstructions.length > 0;
+
+    if (hasInstructions || hasContextInstructions) {
+      const parts: string[] = [];
+      if (hasInstructions) {
+        parts.push(this._instructions!);
+      }
+      if (hasContextInstructions) {
+        parts.push('# Context\n' + contextInstructions.join('\n\n'));
+      }
+
+      systemMessage = {
+        role: MessageRole.System,
+        content: { type: 'text', text: parts.join('\n\n') },
+        timestamp: new Date(),
+      };
+    }
+
+    // Combine: system message + existing messages + context messages + new messages
+    const preparedMessages: ChatMessage[] = [];
+    if (systemMessage) {
+      preparedMessages.push(systemMessage);
+    }
+    preparedMessages.push(...existingMessages);
+    if (contextMessages.length > 0) {
+      preparedMessages.push(...contextMessages);
+    }
+    preparedMessages.push(...newMessages);
+
+    return { preparedMessages, systemMessage };
+  }
+
+  /**
+   * Get tools for execution, combining constructor tools with runtime options.
+   *
+   * @param options - Runtime options
+   * @returns Array of tools to use
+   */
+  private getToolsForExecution(options?: ChatRunOptions): AITool[] | undefined {
+    if (options?.tools) {
+      // Runtime tools override constructor tools
+      return Array.isArray(options.tools) ? options.tools : [options.tools];
+    }
+    return this._tools;
+  }
+
+  /**
+   * Merge chat options from constructor and runtime overrides.
+   *
+   * Runtime options take precedence over constructor options.
+   *
+   * @param runtimeOptions - Runtime options from run() call
+   * @returns Merged chat options for chat client
+   */
+  private mergeChatOptions(runtimeOptions?: ChatRunOptions): Record<string, unknown> {
+    const options: Record<string, unknown> = {};
+
+    // Add constructor options
+    if (this._modelId !== undefined) options.modelId = this._modelId;
+    if (this._temperature !== undefined) options.temperature = this._temperature;
+    if (this._maxTokens !== undefined) options.maxTokens = this._maxTokens;
+    if (this._topP !== undefined) options.topP = this._topP;
+    if (this._frequencyPenalty !== undefined) options.frequencyPenalty = this._frequencyPenalty;
+    if (this._presencePenalty !== undefined) options.presencePenalty = this._presencePenalty;
+    if (this._stop !== undefined) options.stop = this._stop;
+    if (this._seed !== undefined) options.seed = this._seed;
+    if (this._store !== undefined) options.store = this._store;
+    if (this._logitBias !== undefined) options.logitBias = this._logitBias;
+    if (this._user !== undefined) options.user = this._user;
+    if (this._metadata !== undefined) options.metadata = this._metadata;
+    if (this._toolChoice !== undefined) options.toolChoice = this._toolChoice;
+    if (this._responseFormat !== undefined) options.responseFormat = this._responseFormat;
+    if (this._tools !== undefined) options.tools = this._tools;
+    if (this._conversationId !== undefined) options.conversationId = this._conversationId;
+
+    // Merge additional chat options
+    if (this._additionalChatOptions) {
+      Object.assign(options, this._additionalChatOptions);
+    }
+
+    // Override with runtime options (if provided)
+    if (runtimeOptions) {
+      if (runtimeOptions.modelId !== undefined) options.modelId = runtimeOptions.modelId;
+      if (runtimeOptions.temperature !== undefined) options.temperature = runtimeOptions.temperature;
+      if (runtimeOptions.maxTokens !== undefined) options.maxTokens = runtimeOptions.maxTokens;
+      if (runtimeOptions.topP !== undefined) options.topP = runtimeOptions.topP;
+      if (runtimeOptions.frequencyPenalty !== undefined)
+        options.frequencyPenalty = runtimeOptions.frequencyPenalty;
+      if (runtimeOptions.presencePenalty !== undefined)
+        options.presencePenalty = runtimeOptions.presencePenalty;
+      if (runtimeOptions.stop !== undefined) options.stop = runtimeOptions.stop;
+      if (runtimeOptions.seed !== undefined) options.seed = runtimeOptions.seed;
+      if (runtimeOptions.store !== undefined) options.store = runtimeOptions.store;
+      if (runtimeOptions.logitBias !== undefined) options.logitBias = runtimeOptions.logitBias;
+      if (runtimeOptions.user !== undefined) options.user = runtimeOptions.user;
+      if (runtimeOptions.metadata !== undefined) options.metadata = runtimeOptions.metadata;
+      if (runtimeOptions.toolChoice !== undefined) options.toolChoice = runtimeOptions.toolChoice;
+      if (runtimeOptions.responseFormat !== undefined) options.responseFormat = runtimeOptions.responseFormat;
+      if (runtimeOptions.tools !== undefined) {
+        options.tools = Array.isArray(runtimeOptions.tools) ? runtimeOptions.tools : [runtimeOptions.tools];
+      }
+      if (runtimeOptions.additionalChatOptions) {
+        Object.assign(options, runtimeOptions.additionalChatOptions);
+      }
+    }
+
+    return options;
   }
 
   /**
