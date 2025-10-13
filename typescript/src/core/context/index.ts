@@ -9,6 +9,9 @@
  * - AIContext: Interface for context data (instructions, messages, tools)
  * - AggregateContextProvider: Combines multiple context providers
  * - DEFAULT_CONTEXT_PROMPT: Standard prompt for memory/context assembly
+ * - SimpleContextProvider: Static context provider
+ * - RAGContextProvider: Retrieval-augmented generation context provider
+ * - SessionContextProvider: Session-based context provider
  *
  * @module context
  */
@@ -20,3 +23,17 @@ export {
 } from './context-provider.js';
 
 export { AggregateContextProvider } from './aggregate-provider.js';
+
+export { SimpleContextProvider } from './simple-context-provider.js';
+
+export {
+  RAGContextProvider,
+  VectorStore,
+  VectorSearchResult,
+} from './rag-context-provider.js';
+
+export {
+  SessionContextProvider,
+  SessionData,
+  SessionContextProviderOptions,
+} from './session-context-provider.js';
