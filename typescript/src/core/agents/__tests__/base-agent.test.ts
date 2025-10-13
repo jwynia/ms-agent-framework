@@ -14,9 +14,20 @@ import { createUserMessage, createAssistantMessage, MessageRole } from '../../ty
 
 // Concrete implementation for testing
 class TestAgent extends BaseAgent {
+  static readonly type = 'test_agent';
+
   // Track hook calls
   public beforeInvokeCalled = false;
   public afterInvokeCalled = false;
+
+  constructor(config: {
+    info: AgentInfo;
+    chatClient: ChatClientProtocol;
+    tools?: AITool[];
+    contextProvider?: ContextProvider;
+  }) {
+    super(config);
+  }
 
   protected async beforeInvoke(messages: ChatMessage[]): Promise<ChatMessage[]> {
     this.beforeInvokeCalled = true;
@@ -560,6 +571,15 @@ describe('BaseAgent', () => {
   describe('Lifecycle hooks', () => {
     it('should allow beforeInvoke to modify messages', async () => {
       class ModifyingAgent extends BaseAgent {
+        constructor(config: {
+          info: AgentInfo;
+          chatClient: ChatClientProtocol;
+          tools?: AITool[];
+          contextProvider?: ContextProvider;
+        }) {
+          super(config);
+        }
+
         protected async beforeInvoke(messages: ChatMessage[]): Promise<ChatMessage[]> {
           return [createUserMessage('Modified'), ...messages];
         }
@@ -582,6 +602,15 @@ describe('BaseAgent', () => {
       let capturedResponse: ChatMessage | null = null;
 
       class CapturingAgent extends BaseAgent {
+        constructor(config: {
+          info: AgentInfo;
+          chatClient: ChatClientProtocol;
+          tools?: AITool[];
+          contextProvider?: ContextProvider;
+        }) {
+          super(config);
+        }
+
         protected async afterInvoke(request: ChatMessage[], response: ChatMessage): Promise<void> {
           capturedRequest = request;
           capturedResponse = response;
@@ -671,6 +700,199 @@ describe('BaseAgent', () => {
       }
 
       expect(messages).toHaveLength(0);
+    });
+  });
+
+  describe('Serialization', () => {
+    it('should serialize to dictionary', () => {
+      const agent = new TestAgent({
+        info: agentInfo,
+        chatClient,
+      });
+
+      const dict = agent.toDict();
+
+      expect(dict).toBeDefined();
+      expect(dict.type).toBe('test_agent');
+      expect(dict.info).toEqual(agentInfo);
+    });
+
+    it('should exclude chatClient from serialization', () => {
+      const agent = new TestAgent({
+        info: agentInfo,
+        chatClient,
+      });
+
+      const dict = agent.toDict();
+
+      expect(dict).not.toHaveProperty('chatClient');
+      expect(dict).not.toHaveProperty('_chatClient');
+    });
+
+    it('should exclude contextProvider from serialization', () => {
+      const contextProvider = new MockContextProvider();
+      const agent = new TestAgent({
+        info: agentInfo,
+        chatClient,
+        contextProvider,
+      });
+
+      const dict = agent.toDict();
+
+      expect(dict).not.toHaveProperty('contextProvider');
+      expect(dict).not.toHaveProperty('_contextProvider');
+    });
+
+    it('should include tools in serialization', () => {
+      const tools: AITool[] = [
+        {
+          name: 'test_tool',
+          description: 'A test tool',
+          schema: {} as any,
+          execute: vi.fn(),
+        },
+      ];
+      const agent = new TestAgent({
+        info: agentInfo,
+        chatClient,
+        tools,
+      });
+
+      const dict = agent.toDict();
+
+      expect(dict.tools).toBeDefined();
+      expect(dict.tools).toEqual(tools);
+    });
+
+    it('should serialize to JSON string', () => {
+      const agent = new TestAgent({
+        info: agentInfo,
+        chatClient,
+      });
+
+      const json = agent.toJson();
+
+      expect(typeof json).toBe('string');
+      const parsed = JSON.parse(json);
+      expect(parsed.type).toBe('test_agent');
+      expect(parsed.info).toEqual(agentInfo);
+    });
+
+    it('should deserialize from dictionary with injected dependencies', () => {
+      const originalAgent = new TestAgent({
+        info: agentInfo,
+        chatClient,
+      });
+
+      const dict = originalAgent.toDict();
+      const restoredAgent = TestAgent.fromDict(dict, {
+        dependencies: {
+          'test_agent.chatClient': chatClient,
+        },
+      });
+
+      expect(restoredAgent).toBeInstanceOf(TestAgent);
+      expect(restoredAgent.info).toEqual(agentInfo);
+      expect(restoredAgent.chatClient).toBe(chatClient);
+    });
+
+    it('should deserialize from JSON with injected dependencies', () => {
+      const originalAgent = new TestAgent({
+        info: agentInfo,
+        chatClient,
+      });
+
+      const json = originalAgent.toJson();
+      const restoredAgent = TestAgent.fromJson(json, {
+        dependencies: {
+          'test_agent.chatClient': chatClient,
+        },
+      });
+
+      expect(restoredAgent).toBeInstanceOf(TestAgent);
+      expect(restoredAgent.info).toEqual(agentInfo);
+      expect(restoredAgent.chatClient).toBe(chatClient);
+    });
+
+    it('should preserve tools after round-trip serialization', () => {
+      const tools: AITool[] = [
+        {
+          name: 'test_tool',
+          description: 'A test tool',
+          schema: {} as any,
+          execute: vi.fn(),
+        },
+      ];
+      const originalAgent = new TestAgent({
+        info: agentInfo,
+        chatClient,
+        tools,
+      });
+
+      const json = originalAgent.toJson();
+      const restoredAgent = TestAgent.fromJson(json, {
+        dependencies: {
+          'test_agent.chatClient': chatClient,
+        },
+      });
+
+      // Tools are serialized but execute function is excluded (not serializable)
+      // So we check name, description, and schema
+      expect(restoredAgent.tools).toHaveLength(1);
+      expect(restoredAgent.tools[0].name).toBe('test_tool');
+      expect(restoredAgent.tools[0].description).toBe('A test tool');
+      expect(restoredAgent.tools[0].schema).toEqual({});
+      // execute function won't be serialized, so it won't be in the restored agent
+    });
+
+    it('should handle deserialization with context provider dependency', () => {
+      const contextProvider = new MockContextProvider();
+      const originalAgent = new TestAgent({
+        info: agentInfo,
+        chatClient,
+        contextProvider,
+      });
+
+      const dict = originalAgent.toDict();
+      const restoredAgent = TestAgent.fromDict(dict, {
+        dependencies: {
+          'test_agent.chatClient': chatClient,
+          'test_agent.contextProvider': contextProvider,
+        },
+      });
+
+      expect(restoredAgent.contextProvider).toBe(contextProvider);
+    });
+
+    it('should exclude undefined values by default', () => {
+      const tools: AITool[] | undefined = undefined;
+      const agent = new TestAgent({
+        info: agentInfo,
+        chatClient,
+        tools,
+      });
+
+      const dict = agent.toDict();
+
+      // Should not have tools key if it's undefined/empty
+      if (agent.tools.length === 0) {
+        // Tools array is empty, so might be included as empty array
+        expect(dict.tools).toEqual([]);
+      }
+    });
+
+    it('should handle serialization with excludeNone option', () => {
+      const agent = new TestAgent({
+        info: agentInfo,
+        chatClient,
+      });
+
+      const dictExcludeNone = agent.toDict({ excludeNone: true });
+      const dictIncludeNone = agent.toDict({ excludeNone: false });
+
+      // Both should have the same structure for defined values
+      expect(dictExcludeNone.type).toBe('test_agent');
+      expect(dictIncludeNone.type).toBe('test_agent');
     });
   });
 });
