@@ -25,6 +25,8 @@ import type { AITool } from '../tools/base-tool.js';
 import type { ContextProvider } from '../context/context-provider.js';
 import { AgentInitializationError } from '../errors/agent-errors.js';
 import type { AgentInfo } from '../types/agent-info.js';
+import type { AgentMiddleware } from '../../middleware/types.js';
+import { applyMiddleware } from '../../middleware/decorators.js';
 import { getLogger } from '../logging/logger.js';
 import { ThreadType } from '../threads/service-thread-types.js';
 
@@ -248,6 +250,17 @@ export class ChatAgent extends BaseAgent {
     this._toolChoice = options.toolChoice;
     this._responseFormat = options.responseFormat;
     this._additionalChatOptions = options.additionalChatOptions;
+
+    // Apply middleware if provided
+    if (options.middleware) {
+      const middlewareArray = Array.isArray(options.middleware)
+        ? (options.middleware as AgentMiddleware[])
+        : [options.middleware as AgentMiddleware];
+
+      if (middlewareArray.length > 0) {
+        applyMiddleware(middlewareArray)(this);
+      }
+    }
   }
 
   /**
