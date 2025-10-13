@@ -56,9 +56,25 @@ export type {
   Middleware,
   AgentMiddleware,
   FunctionMiddleware,
+  FunctionMiddlewareInterface,
   AgentContext,
   FunctionContext,
+  FunctionInvokingContext,
+  FunctionInvokedContext,
   NextFunction,
 } from './types.js';
 
 export { wrapWithMiddleware, wrapStreamWithMiddleware, applyMiddleware } from './decorators.js';
+
+export {
+  FunctionMiddlewarePipeline,
+  LoggingFunctionMiddleware,
+  CachingFunctionMiddleware,
+  TimingFunctionMiddleware,
+  RateLimitingFunctionMiddleware,
+} from './function-middleware.js';
+
+export type {
+  FunctionInvokingContext as FunctionInvokingContextWithTool,
+  FunctionInvokedContext as FunctionInvokedContextWithTool,
+} from './function-middleware.js';

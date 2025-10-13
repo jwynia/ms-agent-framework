@@ -3,7 +3,7 @@
  *
  * Core logic for executing function calls automatically during agent execution.
  * Handles function call detection, argument validation, execution, and result handling
- * with support for multiple iterations and approval workflows.
+ * with support for multiple iterations, approval workflows, and middleware.
  *
  * @module tools/execution-engine
  */
@@ -16,6 +16,7 @@ import type {
   FunctionApprovalResponseContent,
   Content,
 } from '../types/chat-message.js';
+import type { FunctionMiddlewarePipeline } from '../../middleware/function-middleware.js';
 // ZodError is used implicitly by schema.parse() in error handling
 
 /**
@@ -66,12 +67,14 @@ export function buildToolMap(tools: AITool[]): Map<string, AITool> {
  * 1. Validates the function exists in the tool map
  * 2. Checks if approval is required
  * 3. Parses and validates arguments against the tool's schema
- * 4. Executes the function
- * 5. Wraps result or error in FunctionResultContent
+ * 4. Applies middleware pipeline if provided
+ * 5. Executes the function
+ * 6. Wraps result or error in FunctionResultContent
  *
  * @param functionCall - The function call to execute
  * @param toolMap - Map of available tools
  * @param customArgs - Optional custom arguments to merge with parsed arguments
+ * @param middlewarePipeline - Optional middleware pipeline to apply
  * @returns FunctionResultContent with result or error, or FunctionApprovalRequestContent if approval required
  *
  * @example
@@ -79,7 +82,8 @@ export function buildToolMap(tools: AITool[]): Map<string, AITool> {
  * const result = await autoInvokeFunction(
  *   { type: 'function_call', callId: '123', name: 'get_weather', arguments: '{"location": "Seattle"}' },
  *   toolMap,
- *   {}
+ *   {},
+ *   middlewarePipeline
  * );
  * // { type: 'function_result', callId: '123', result: { temp: 72 } }
  * ```
@@ -87,7 +91,8 @@ export function buildToolMap(tools: AITool[]): Map<string, AITool> {
 export async function autoInvokeFunction(
   functionCall: FunctionCallContent | FunctionApprovalResponseContent,
   toolMap: Map<string, AITool>,
-  customArgs?: Record<string, unknown>
+  customArgs?: Record<string, unknown>,
+  middlewarePipeline?: FunctionMiddlewarePipeline,
 ): Promise<FunctionResultContent | FunctionApprovalRequestContent> {
   // Handle approval response
   let actualFunctionCall: FunctionCallContent;
@@ -137,8 +142,24 @@ export async function autoInvokeFunction(
     // Validate arguments against schema
     const validatedArgs = tool.schema.parse(mergedArgs);
 
-    // Execute the tool
-    const result = await tool.execute(validatedArgs);
+    // Execute the tool with or without middleware
+    let result: unknown;
+
+    if (middlewarePipeline && middlewarePipeline.hasMiddleware) {
+      // Execute through middleware pipeline
+      result = await middlewarePipeline.execute(
+        tool,
+        validatedArgs as Record<string, unknown>,
+        customArgs || {},
+        async (context) => {
+          // Final handler: execute the tool with (potentially modified) arguments
+          return await tool.execute(context.arguments);
+        },
+      );
+    } else {
+      // Execute directly without middleware
+      result = await tool.execute(validatedArgs);
+    }
 
     // Return success result
     return {
@@ -166,6 +187,7 @@ export async function autoInvokeFunction(
  * @param functionCalls - Array of function calls to execute
  * @param tools - Array of available tools
  * @param customArgs - Optional custom arguments to merge with each function's arguments
+ * @param middlewarePipeline - Optional middleware pipeline to apply to all function calls
  * @returns Array of results (FunctionResultContent or FunctionApprovalRequestContent)
  *
  * @example
@@ -173,7 +195,8 @@ export async function autoInvokeFunction(
  * const results = await executeFunctionCalls(
  *   [weatherCall, calculatorCall],
  *   [weatherTool, calculatorTool],
- *   {}
+ *   {},
+ *   middlewarePipeline
  * );
  * // [{ type: 'function_result', callId: '1', result: {...} }, ...]
  * ```
@@ -181,7 +204,8 @@ export async function autoInvokeFunction(
 export async function executeFunctionCalls(
   functionCalls: Array<FunctionCallContent | FunctionApprovalResponseContent>,
   tools: AITool[],
-  customArgs?: Record<string, unknown>
+  customArgs?: Record<string, unknown>,
+  middlewarePipeline?: FunctionMiddlewarePipeline,
 ): Promise<Array<FunctionResultContent | FunctionApprovalRequestContent>> {
   const toolMap = buildToolMap(tools);
 
@@ -209,7 +233,7 @@ export async function executeFunctionCalls(
   }
 
   // Execute all function calls concurrently
-  return await Promise.all(functionCalls.map((fc) => autoInvokeFunction(fc, toolMap, customArgs)));
+  return await Promise.all(functionCalls.map((fc) => autoInvokeFunction(fc, toolMap, customArgs, middlewarePipeline)));
 }
 
 /**
