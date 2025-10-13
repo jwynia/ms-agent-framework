@@ -185,6 +185,24 @@ describe('Tool Execution Engine', () => {
     });
 
     it('should return approval request for approval-required tool', async () => {
+      mockTool.approvalMode = 'always_require';
+
+      const functionCall: FunctionCallContent = {
+        type: 'function_call',
+        callId: 'call_123',
+        name: 'test_tool',
+        arguments: '{"x": 5}',
+      };
+
+      const result = await autoInvokeFunction(functionCall, toolMap);
+
+      expect(result.type).toBe('function_approval_request');
+      expect((result as FunctionApprovalRequestContent).id).toBe('call_123');
+      expect((result as FunctionApprovalRequestContent).functionCall).toBe(functionCall);
+      expect(mockTool.execute).not.toHaveBeenCalled();
+    });
+
+    it('should return approval request for tool with metadata approvalMode (legacy)', async () => {
       mockTool.metadata = { approvalMode: 'always_require' };
 
       const functionCall: FunctionCallContent = {
@@ -297,7 +315,7 @@ describe('Tool Execution Engine', () => {
     });
 
     it('should return approval requests for all calls if any require approval', async () => {
-      tool1.metadata = { approvalMode: 'always_require' };
+      tool1.approvalMode = 'always_require';
 
       const calls: FunctionCallContent[] = [
         {

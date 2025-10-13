@@ -1,6 +1,12 @@
 import { z } from 'zod';
 
 /**
+ * Approval mode for tool execution.
+ * Controls whether human approval is required before executing the tool.
+ */
+export type ApprovalMode = 'always_require' | 'never_require';
+
+/**
  * Core interface for AI tools that can be invoked by LLMs.
  *
  * Tools are functions that the AI model can call to perform actions or retrieve information.
@@ -57,8 +63,33 @@ export interface AITool {
   /**
    * Optional metadata associated with the tool.
    * Can be used for custom properties like approval modes, rate limits, etc.
+   *
+   * For approval mode, use the approvalMode property instead of metadata.approvalMode.
    */
   metadata?: Record<string, unknown>;
+
+  /**
+   * Approval mode for the tool.
+   * When set to 'always_require', the tool will not execute until explicit human approval is given.
+   * When set to 'never_require' (default), the tool executes immediately without approval.
+   *
+   * @default 'never_require'
+   *
+   * @example
+   * ```typescript
+   * const dangerousTool: AITool = {
+   *   name: 'delete_database',
+   *   description: 'Delete entire database',
+   *   approvalMode: 'always_require',
+   *   schema: z.object({}),
+   *   async execute() {
+   *     // This will only run after approval
+   *     return { deleted: true };
+   *   },
+   * };
+   * ```
+   */
+  approvalMode?: ApprovalMode;
 }
 
 /**
@@ -105,6 +136,7 @@ export abstract class BaseTool implements AITool {
   public readonly description: string;
   public readonly schema: z.ZodSchema;
   public readonly metadata?: Record<string, unknown>;
+  public readonly approvalMode?: ApprovalMode;
 
   /**
    * Create a new base tool.
@@ -114,17 +146,20 @@ export abstract class BaseTool implements AITool {
    * @param config.description - Human-readable description of the tool
    * @param config.schema - Zod schema for parameter validation
    * @param config.metadata - Optional metadata for the tool
+   * @param config.approvalMode - Optional approval mode ('always_require' or 'never_require')
    */
   constructor(config: {
     name: string;
     description: string;
     schema: z.ZodSchema;
     metadata?: Record<string, unknown>;
+    approvalMode?: ApprovalMode;
   }) {
     this.name = config.name;
     this.description = config.description;
     this.schema = config.schema;
     this.metadata = config.metadata;
+    this.approvalMode = config.approvalMode;
   }
 
   /**
@@ -201,6 +236,7 @@ export class FunctionTool extends BaseTool {
    * @param config.schema - Zod schema for parameter validation
    * @param config.fn - The function to wrap (sync or async)
    * @param config.metadata - Optional metadata for the tool
+   * @param config.approvalMode - Optional approval mode ('always_require' or 'never_require')
    */
   constructor(config: {
     name: string;
@@ -208,12 +244,14 @@ export class FunctionTool extends BaseTool {
     schema: z.ZodSchema;
     fn: (params: unknown) => Promise<unknown> | unknown;
     metadata?: Record<string, unknown>;
+    approvalMode?: ApprovalMode;
   }) {
     super({
       name: config.name,
       description: config.description,
       schema: config.schema,
       metadata: config.metadata,
+      approvalMode: config.approvalMode,
     });
 
     // Normalize sync/async functions to always be async

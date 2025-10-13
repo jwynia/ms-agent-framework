@@ -16,7 +16,7 @@
  * @module tools
  */
 
-export { AITool, BaseTool, FunctionTool, createTool } from './base-tool.js';
+export { AITool, BaseTool, FunctionTool, createTool, ApprovalMode } from './base-tool.js';
 export {
   aiFunction,
   getAIFunctionMetadata,
