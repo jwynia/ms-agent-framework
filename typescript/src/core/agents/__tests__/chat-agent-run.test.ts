@@ -356,7 +356,8 @@ describe('TASK-101c: ChatAgent run() Method', () => {
       expect(options.tools).toEqual([mockTool]);
     });
 
-    it('should override tools with runtime options', async () => {
+    it('should combine constructor and runtime tools', async () => {
+      // TASK-101e: With MCP support, tools are now combined rather than replaced
       const constructorTool: AITool = { name: 'tool1', description: 'Tool 1' } as AITool;
       const runtimeTool: AITool = { name: 'tool2', description: 'Tool 2' } as AITool;
       const responseMessage = createAssistantMessage('OK');
@@ -374,7 +375,9 @@ describe('TASK-101c: ChatAgent run() Method', () => {
       const callArgs = vi.mocked(mockClient.complete).mock.calls[0];
       const options = callArgs[1] as Record<string, unknown>;
 
-      expect(options.tools).toEqual([runtimeTool]);
+      // Now tools are combined (constructor + runtime)
+      expect(options.tools).toContainEqual(constructorTool);
+      expect(options.tools).toContainEqual(runtimeTool);
     });
 
     it('should merge additional chat options', async () => {

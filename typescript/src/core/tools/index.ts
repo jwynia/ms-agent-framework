@@ -29,3 +29,4 @@ export {
   type JsonSchema,
   type AIToolSchema,
 } from './schema.js';
+export { type MCPTool, isMCPTool } from './mcp-tool.js';

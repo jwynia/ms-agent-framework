@@ -14,6 +14,7 @@ import type {
   ChatAgentOptions,
   ChatRunOptions,
   ToolChoice,
+  UsageDetails,
 } from './chat-agent-types.js';
 import { AgentRunResponse, AgentRunResponseUpdate } from './chat-agent-types.js';
 import type { ChatMessage, Content } from '../types/chat-message.js';
@@ -21,9 +22,11 @@ import { MessageRole } from '../types/chat-message.js';
 import { AgentThread } from './agent-thread.js';
 import type { ChatMessageStore } from '../storage/message-store.js';
 import type { AITool } from '../tools/base-tool.js';
+import { type MCPTool, isMCPTool } from '../tools/mcp-tool.js';
 import type { ContextProvider } from '../context/context-provider.js';
 import { AgentInitializationError } from '../errors/agent-errors.js';
 import type { AgentInfo } from '../types/agent-info.js';
+import { AsyncExitStack } from '../utils/async-exit-stack.js';
 
 /**
  * ChatAgent - Main agent class for chat-based interactions.
@@ -72,10 +75,12 @@ import type { AgentInfo } from '../types/agent-info.js';
  * });
  * ```
  */
-export class ChatAgent extends BaseAgent {
+export class ChatAgent extends BaseAgent implements AsyncDisposable {
   private readonly _chatClient: ChatClientProtocol;
   private readonly _instructions?: string;
   private readonly _tools?: AITool[];
+  private readonly _localMcpTools: MCPTool[];
+  private readonly _asyncExitStack: AsyncExitStack;
   private readonly _messageStoreFactory?: () => ChatMessageStore;
   private readonly _conversationId?: string;
   private readonly _contextProviders?: ContextProvider[];
@@ -155,8 +160,20 @@ export class ChatAgent extends BaseAgent {
       metadata: options.metadata,
     };
 
-    // Normalize tools to array for parent constructor
-    const toolsArray = options.tools ? (Array.isArray(options.tools) ? options.tools : [options.tools]) : [];
+    // Normalize tools to array
+    const allTools = options.tools ? (Array.isArray(options.tools) ? options.tools : [options.tools]) : [];
+
+    // Separate MCP tools from regular tools
+    const mcpTools: MCPTool[] = [];
+    const regularTools: AITool[] = [];
+
+    for (const tool of allTools) {
+      if (isMCPTool(tool)) {
+        mcpTools.push(tool);
+      } else {
+        regularTools.push(tool as AITool);
+      }
+    }
 
     // Normalize context providers to array
     const contextProvidersArray = options.contextProviders
@@ -169,7 +186,7 @@ export class ChatAgent extends BaseAgent {
     super({
       info,
       chatClient: options.chatClient,
-      tools: toolsArray,
+      tools: regularTools,
       contextProvider: contextProvidersArray?.[0],
     });
 
@@ -179,8 +196,14 @@ export class ChatAgent extends BaseAgent {
     this._messageStoreFactory = options.messageStoreFactory;
     this._conversationId = options.conversationId;
 
-    // Store normalized tools
-    this._tools = toolsArray.length > 0 ? toolsArray : undefined;
+    // Store normalized tools (only regular tools, not MCP)
+    this._tools = regularTools.length > 0 ? regularTools : undefined;
+
+    // Store MCP tools separately
+    this._localMcpTools = mcpTools;
+
+    // Initialize AsyncExitStack for MCP lifecycle management
+    this._asyncExitStack = new AsyncExitStack();
 
     // Store normalized context providers
     this._contextProviders = contextProvidersArray;
@@ -260,6 +283,60 @@ export class ChatAgent extends BaseAgent {
       // Undetermined thread (will be determined on first use)
       return new AgentThread();
     }
+  }
+
+  /**
+   * Resolve final tools by combining constructor tools with runtime tools and MCP functions.
+   *
+   * This method:
+   * 1. Starts with constructor tools (regular tools only)
+   * 2. Adds runtime-provided tools (regular + MCP)
+   * 3. Connects runtime MCP tools if needed
+   * 4. Resolves runtime MCP tool functions
+   * 5. Connects constructor MCP tools if needed
+   * 6. Resolves constructor MCP tool functions
+   *
+   * @param constructorTools - Tools provided in constructor
+   * @param runtimeTools - Tools provided at runtime (optional)
+   * @returns Promise resolving to final array of AITool objects
+   * @private
+   */
+  private async resolveFinalTools(
+    constructorTools: AITool[] | undefined,
+    runtimeTools?: AITool | AITool[] | MCPTool | MCPTool[],
+  ): Promise<AITool[]> {
+    const finalTools: AITool[] = [...(constructorTools || [])];
+
+    // Handle runtime tools
+    if (runtimeTools) {
+      const runtimeArray = Array.isArray(runtimeTools) ? runtimeTools : [runtimeTools];
+
+      for (const tool of runtimeArray) {
+        if (isMCPTool(tool)) {
+          // Connect MCP tool if not already connected
+          if (!tool.isConnected) {
+            await this._asyncExitStack.enterAsyncContext(tool);
+          }
+          // Resolve and add MCP tool functions
+          const mcpFunctions = await tool.getFunctions();
+          finalTools.push(...mcpFunctions);
+        } else {
+          // Add regular tool directly
+          finalTools.push(tool as AITool);
+        }
+      }
+    }
+
+    // Connect and resolve constructor MCP tools
+    for (const mcpTool of this._localMcpTools) {
+      if (!mcpTool.isConnected) {
+        await this._asyncExitStack.enterAsyncContext(mcpTool);
+      }
+      const mcpFunctions = await mcpTool.getFunctions();
+      finalTools.push(...mcpFunctions);
+    }
+
+    return finalTools;
   }
 
   /**
@@ -361,10 +438,13 @@ export class ChatAgent extends BaseAgent {
     // 3. Prepare thread and messages
     const { preparedMessages } = await this.prepareThreadAndMessages(thread, normalizedMessages, options);
 
-    // 4. Merge chat options (constructor + runtime overrides)
-    const chatOptions = this.mergeChatOptions(options);
+    // 4. Resolve final tools (including MCP tools)
+    const finalTools = await this.resolveFinalTools(this._tools, options?.tools);
 
-    // 5. Call chat client
+    // 5. Merge chat options (constructor + runtime overrides) with resolved tools
+    const chatOptions = this.mergeChatOptions(options, finalTools);
+
+    // 6. Call chat client
     const responseMessage = await this._chatClient.complete(preparedMessages, chatOptions);
 
     // 6. Extract metadata from response
@@ -494,9 +574,10 @@ export class ChatAgent extends BaseAgent {
    * Runtime options take precedence over constructor options.
    *
    * @param runtimeOptions - Runtime options from run() call
+   * @param resolvedTools - Resolved tools (including MCP functions)
    * @returns Merged chat options for chat client
    */
-  private mergeChatOptions(runtimeOptions?: ChatRunOptions): Record<string, unknown> {
+  private mergeChatOptions(runtimeOptions?: ChatRunOptions, resolvedTools?: AITool[]): Record<string, unknown> {
     const options: Record<string, unknown> = {};
 
     // Add constructor options
@@ -514,7 +595,9 @@ export class ChatAgent extends BaseAgent {
     if (this._metadata !== undefined) options.metadata = this._metadata;
     if (this._toolChoice !== undefined) options.toolChoice = this._toolChoice;
     if (this._responseFormat !== undefined) options.responseFormat = this._responseFormat;
-    if (this._tools !== undefined) options.tools = this._tools;
+    // Use resolved tools if provided, otherwise fall back to constructor tools
+    if (resolvedTools !== undefined) options.tools = resolvedTools;
+    else if (this._tools !== undefined) options.tools = this._tools;
     if (this._conversationId !== undefined) options.conversationId = this._conversationId;
 
     // Merge additional chat options
@@ -540,9 +623,7 @@ export class ChatAgent extends BaseAgent {
       if (runtimeOptions.metadata !== undefined) options.metadata = runtimeOptions.metadata;
       if (runtimeOptions.toolChoice !== undefined) options.toolChoice = runtimeOptions.toolChoice;
       if (runtimeOptions.responseFormat !== undefined) options.responseFormat = runtimeOptions.responseFormat;
-      if (runtimeOptions.tools !== undefined) {
-        options.tools = Array.isArray(runtimeOptions.tools) ? runtimeOptions.tools : [runtimeOptions.tools];
-      }
+      // Note: tools are handled separately via resolveFinalTools()
       if (runtimeOptions.additionalChatOptions) {
         Object.assign(options, runtimeOptions.additionalChatOptions);
       }
@@ -596,10 +677,13 @@ export class ChatAgent extends BaseAgent {
     // 3. Prepare thread and messages (reuse from run())
     const { preparedMessages } = await this.prepareThreadAndMessages(thread, normalizedMessages, options);
 
-    // 4. Merge chat options
-    const chatOptions = this.mergeChatOptions(options);
+    // 4. Resolve final tools (including MCP tools)
+    const finalTools = await this.resolveFinalTools(this._tools, options?.tools);
 
-    // 5. Get streaming response from chat client
+    // 5. Merge chat options with resolved tools
+    const chatOptions = this.mergeChatOptions(options, finalTools);
+
+    // 6. Get streaming response from chat client
     const streamingResponse = this._chatClient.completeStream(preparedMessages, chatOptions);
 
     // Accumulate all updates for thread update after streaming completes
@@ -693,5 +777,37 @@ export class ChatAgent extends BaseAgent {
 
     // 10. Store messages in thread
     await thread.onNewMessages([...normalizedMessages, ...completeResponse.messages]);
+  }
+
+  /**
+   * Cleanup method for async disposal.
+   *
+   * Implements AsyncDisposable to ensure proper cleanup of MCP tool connections
+   * and other async resources. This method is called automatically when using
+   * `await using` syntax or can be called manually.
+   *
+   * @returns Promise that resolves when all resources are cleaned up
+   *
+   * @example
+   * ```typescript
+   * // Using await using syntax (automatic disposal)
+   * await using agent = new ChatAgent({ ... });
+   * await agent.run('Hello');
+   * // agent automatically disposed here
+   * ```
+   *
+   * @example
+   * ```typescript
+   * // Manual disposal
+   * const agent = new ChatAgent({ ... });
+   * try {
+   *   await agent.run('Hello');
+   * } finally {
+   *   await agent[Symbol.asyncDispose]();
+   * }
+   * ```
+   */
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this._asyncExitStack.aclose();
   }
 }
