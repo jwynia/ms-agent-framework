@@ -553,25 +553,145 @@ export class ChatAgent extends BaseAgent {
 
   /**
    * Execute agent with streaming response.
-   * **NOTE**: This method is not yet implemented. See TASK-101d.
    *
-   * @param messages - Input messages (string, ChatMessage, or array of ChatMessage)
+   * Similar to run() but yields AgentRunResponseUpdate objects as they arrive
+   * from the chat client. The final update has isFinal: true.
+   *
+   * After streaming completes, updates thread state just like run().
+   *
+   * @param messages - Input messages (string, ChatMessage, or ChatMessage[])
    * @param options - Optional run configuration
    * @returns AsyncIterable yielding response updates
-   * @throws {Error} Not yet implemented
+   *
+   * @example
+   * ```typescript
+   * // Basic streaming
+   * for await (const update of agent.runStream('Tell me a story')) {
+   *   process.stdout.write(update.text);
+   *   if (update.isFinal) {
+   *     console.log('\nDone!');
+   *   }
+   * }
+   * ```
+   *
+   * @example
+   * ```typescript
+   * // With thread
+   * const thread = agent.getNewThread();
+   * for await (const update of agent.runStream('Hello', { thread })) {
+   *   console.log(update.text);
+   * }
+   * ```
    */
   async *runStream(
     messages: string | ChatMessage | ChatMessage[],
     options?: ChatRunOptions,
   ): AsyncIterable<AgentRunResponseUpdate> {
-    // Suppress unused variable warnings - these will be used in TASK-101d
-    void messages;
-    void options;
-    throw new Error('runStream() method not implemented yet - see TASK-101d');
-    // Make TypeScript happy about the generator
-    yield new AgentRunResponseUpdate({
-      role: MessageRole.Assistant,
-      content: { type: 'text', text: '' },
-    });
+    // 1. Normalize messages
+    const normalizedMessages = this.normalizeMessages(messages);
+
+    // 2. Get or create thread
+    const thread = options?.thread || this.getNewThread();
+
+    // 3. Prepare thread and messages (reuse from run())
+    const { preparedMessages } = await this.prepareThreadAndMessages(thread, normalizedMessages, options);
+
+    // 4. Merge chat options
+    const chatOptions = this.mergeChatOptions(options);
+
+    // 5. Get streaming response from chat client
+    const streamingResponse = this._chatClient.completeStream(preparedMessages, chatOptions);
+
+    // Accumulate all updates for thread update after streaming completes
+    const allUpdates: AgentRunResponseUpdate[] = [];
+    let conversationId: string | undefined;
+    let currentResponseId: string | undefined;
+    let currentUsage: UsageDetails | undefined;
+    let currentMetadata: Record<string, unknown> = {};
+
+    // Track if we've seen the final event
+    let hasSeenFinal = false;
+
+    // 6. Yield updates as they arrive
+    for await (const event of streamingResponse) {
+      if (event.type === 'message_delta') {
+        // Extract content from delta
+        const delta = event.delta;
+        const content = delta.content;
+        const role = delta.role || MessageRole.Assistant;
+
+        // Create AgentRunResponseUpdate from delta
+        const update = new AgentRunResponseUpdate({
+          content,
+          role,
+          authorName: delta.name,
+          responseId: currentResponseId,
+          createdAt: delta.timestamp,
+          isFinal: false,
+        });
+
+        allUpdates.push(update);
+        yield update;
+      } else if (event.type === 'usage') {
+        // Store usage information
+        currentUsage = {
+          promptTokens: event.usage.promptTokens,
+          completionTokens: event.usage.completionTokens,
+          totalTokens: event.usage.totalTokens,
+        };
+      } else if (event.type === 'metadata') {
+        // Store metadata including conversation ID
+        const metadata = event.metadata;
+        currentMetadata = { ...metadata };
+
+        // Extract conversation ID if present
+        if (metadata.conversationId) {
+          conversationId = metadata.conversationId as string;
+        }
+
+        // Extract response ID if present
+        if (metadata.responseId) {
+          currentResponseId = metadata.responseId as string;
+        }
+
+        // Mark this as the final update
+        hasSeenFinal = true;
+      }
+    }
+
+    // 7. Yield final update if we have accumulated content
+    if (allUpdates.length > 0 && !hasSeenFinal) {
+      // Create a final marker update if metadata event didn't arrive
+      const finalUpdate = new AgentRunResponseUpdate({
+        content: { type: 'text', text: '' },
+        role: MessageRole.Assistant,
+        responseId: currentResponseId,
+        isFinal: true,
+        usageDetails: currentUsage,
+      });
+      allUpdates.push(finalUpdate);
+      yield finalUpdate;
+    } else if (hasSeenFinal) {
+      // Yield final update with metadata
+      const finalUpdate = new AgentRunResponseUpdate({
+        content: { type: 'text', text: '' },
+        role: MessageRole.Assistant,
+        responseId: currentResponseId,
+        isFinal: true,
+        usageDetails: currentUsage,
+        additionalProperties: currentMetadata,
+      });
+      allUpdates.push(finalUpdate);
+      yield finalUpdate;
+    }
+
+    // 8. After streaming completes, update thread
+    thread.updateWithConversationId(conversationId, this._messageStoreFactory);
+
+    // 9. Convert updates to complete response for message storage
+    const completeResponse = AgentRunResponse.fromUpdates(allUpdates);
+
+    // 10. Store messages in thread
+    await thread.onNewMessages([...normalizedMessages, ...completeResponse.messages]);
   }
 }
