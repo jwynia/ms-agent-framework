@@ -222,7 +222,7 @@ export interface Middleware<TContext = AgentContext> {
 export type AgentMiddleware = Middleware<AgentContext>;
 
 /**
- * Convenience type for function-specific middleware.
+ * Convenience type for function-specific middleware (function-based).
  *
  * This is equivalent to `Middleware<FunctionContext>` but provides better type
  * inference and documentation.
@@ -238,3 +238,86 @@ export type AgentMiddleware = Middleware<AgentContext>;
  * ```
  */
 export type FunctionMiddleware = Middleware<FunctionContext>;
+
+/**
+ * Interface-based function middleware with separate invoking/invoked phases.
+ *
+ * This interface provides more granular control over function execution by
+ * separating pre-execution (invoking) and post-execution (invoked) phases.
+ * Follows the Python reference implementation pattern.
+ *
+ * Use this when you need:
+ * - Different logic for before and after execution
+ * - Access to results and errors in the invoked phase
+ * - Early termination via 'skip' return value
+ *
+ * @example
+ * ```typescript
+ * class CachingMiddleware implements FunctionMiddlewareInterface {
+ *   private cache = new Map();
+ *
+ *   async onFunctionInvoking(context) {
+ *     const cached = this.cache.get(key);
+ *     if (cached) {
+ *       context.result = cached;
+ *       return 'skip'; // Skip execution
+ *     }
+ *   }
+ *
+ *   async onFunctionInvoked(context) {
+ *     if (!context.error) {
+ *       this.cache.set(key, context.result);
+ *     }
+ *   }
+ * }
+ * ```
+ */
+export interface FunctionMiddlewareInterface {
+  /**
+   * Called before function execution.
+   *
+   * Middleware can:
+   * - Inspect and modify arguments
+   * - Set context.result and return 'skip' to short-circuit
+   * - Store metadata for use in onFunctionInvoked
+   *
+   * @param context - The function invocation context
+   * @returns 'skip' to short-circuit execution, void to continue
+   */
+  onFunctionInvoking?(context: FunctionInvokingContext): Promise<void | 'skip'>;
+
+  /**
+   * Called after function execution.
+   *
+   * Middleware can:
+   * - Observe the result or error
+   * - Perform cleanup or logging
+   * - Access metadata set during invoking phase
+   *
+   * @param context - The function invocation context with result/error
+   */
+  onFunctionInvoked?(context: FunctionInvokedContext): Promise<void>;
+}
+
+/**
+ * Context for function middleware invoking phase.
+ *
+ * @see FunctionMiddlewareInterface
+ */
+export interface FunctionInvokingContext {
+  readonly function: { name: string; [key: string]: unknown };
+  arguments: Record<string, unknown>;
+  kwargs: Record<string, unknown>;
+  readonly metadata: Record<string, unknown>;
+  result?: unknown;
+}
+
+/**
+ * Context for function middleware invoked phase.
+ *
+ * @see FunctionMiddlewareInterface
+ */
+export interface FunctionInvokedContext extends FunctionInvokingContext {
+  result?: unknown;
+  error?: Error;
+}
