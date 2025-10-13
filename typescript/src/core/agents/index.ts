@@ -8,6 +8,7 @@
 
 export { AgentThread, AgentThreadOptions, ThreadState, MessageStoreState } from './agent-thread.js';
 export { BaseAgent, AgentProtocol } from './base-agent.js';
+export { ChatAgent } from './chat-agent.js';
 export {
   AgentRunResponse,
   AgentRunResponseUpdate,
