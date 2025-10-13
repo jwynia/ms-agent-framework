@@ -10,6 +10,8 @@
  * - createTool helper for easy tool creation
  * - @aiFunction decorator for marking methods as AI functions
  * - Schema conversion utilities for LLM integration
+ * - Tool execution engine for automatic function invocation
+ * - useFunctionInvocation decorator for chat clients
  *
  * @module tools
  */
@@ -30,3 +32,12 @@ export {
   type AIToolSchema,
 } from './schema.js';
 export { type MCPTool, isMCPTool } from './mcp-tool.js';
+export {
+  autoInvokeFunction,
+  executeFunctionCalls,
+  parseArguments,
+  buildToolMap,
+  extractFunctionCalls,
+  extractFunctionResults,
+} from './execution-engine.js';
+export { useFunctionInvocation, DEFAULT_MAX_ITERATIONS } from './function-invoking-client.js';
